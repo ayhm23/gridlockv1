@@ -1,0 +1,24 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Caches
+.ipynb_checkpoints
+.pytest_cache/
+.mypy_cache/
+
+# Datasets (large files ignored, raw CSVs can be kept or ignored, we will ignore processed data to keep git history lightweight)
+data/processed/
+dataset/
+
+# Logs
+logs/
+
+# IDE files
+.vscode/
+.idea/
+
+# System / Agent files
+.gemini/
+*.log
