@@ -62,6 +62,8 @@ class FeatureEngineer:
         self.geohash_means     : pd.Series | None = None
         self.cat_means         : dict             = {}   # col → {cat → mean}
         self.global_mean       : float            = 0.0
+        # RoadType geohash-level modal imputation (fitted on train, applied to test)
+        self.roadtype_lookup   : dict             = {}   # geohash → modal RoadType
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public API
@@ -77,6 +79,11 @@ class FeatureEngineer:
 
         # Step 0: ensure chronological order
         df = self._sort_chronologically(df)
+
+        # Step 0b: impute RoadType NaN via geohash modal lookup (fit + apply)
+        # RoadType is the highest-signal feature (corr=0.86). All 600 NaN rows
+        # in train and 324 in test can be filled this way.
+        df = self._fit_impute_roadtype(df)
 
         # Step 1: core temporal + cyclic (already done in preprocessing,
         #         but we re-derive to be safe if running standalone)
@@ -131,6 +138,7 @@ class FeatureEngineer:
         df = df.copy()
 
         df = self._sort_chronologically(df)
+        df = self._impute_roadtype(df)    # apply fitted RoadType lookup to test
         df = self._ensure_temporal_cols(df)
         df = self._apply_spatial_clusters(df)
         df = self._apply_label_encode(df)
@@ -150,6 +158,35 @@ class FeatureEngineer:
     # ──────────────────────────────────────────────────────────────────────────
     # Internal helpers
     # ──────────────────────────────────────────────────────────────────────────
+
+    def _fit_impute_roadtype(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Fits geohash → RoadType modal lookup from known rows, then fills NaN."""
+        if "RoadType" not in df.columns or "geohash" not in df.columns:
+            return df
+        known = df.dropna(subset=["RoadType"])
+        if len(known) > 0:
+            self.roadtype_lookup = (
+                known.groupby("geohash", observed=True)["RoadType"]
+                .agg(lambda x: x.mode()[0])
+                .to_dict()
+            )
+            n_before = df["RoadType"].isna().sum()
+            mask = df["RoadType"].isna()
+            df.loc[mask, "RoadType"] = df.loc[mask, "geohash"].map(self.roadtype_lookup)
+            n_after = df["RoadType"].isna().sum()
+            logger.info(f"RoadType imputation (train): {n_before} NaN → {n_after} NaN")
+        return df
+
+    def _impute_roadtype(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Applies the fitted roadtype_lookup to test data."""
+        if not self.roadtype_lookup or "RoadType" not in df.columns:
+            return df
+        n_before = df["RoadType"].isna().sum()
+        mask = df["RoadType"].isna()
+        df.loc[mask, "RoadType"] = df.loc[mask, "geohash"].map(self.roadtype_lookup)
+        n_after = df["RoadType"].isna().sum()
+        logger.info(f"RoadType imputation (test): {n_before} NaN → {n_after} NaN")
+        return df
 
     def _sort_chronologically(self, df: pd.DataFrame) -> pd.DataFrame:
         sort_cols = [c for c in ["day", "time_slot"] if c in df.columns]
@@ -446,6 +483,22 @@ class FeatureEngineer:
                 df["geohash_id"].astype(np.int32) * 96 +
                 df["time_slot"].astype(np.int32)
             ).astype(np.int32)
+
+        # Highway flag: 9× demand difference vs non-highway (analysis finding #2)
+        # is_highway = True if RoadType==Highway OR NumberofLanes >= 4
+        if "RoadType" in df.columns or "NumberofLanes" in df.columns:
+            is_hw = pd.Series(False, index=df.index)
+            if "RoadType" in df.columns:
+                is_hw = is_hw | (df["RoadType"] == "Highway")
+            if "NumberofLanes" in df.columns:
+                is_hw = is_hw | (df["NumberofLanes"] >= 4)
+            df["is_highway"] = is_hw.astype(np.int8)
+
+            # Highway × time_slot: captures rush-hour highway surge
+            if "time_slot" in df.columns:
+                df["highway_x_slot"] = (
+                    df["is_highway"].astype(np.int32) * df["time_slot"].astype(np.int32)
+                ).astype(np.int32)
 
         return df
 
