@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 CATEGORICAL_COLS  = ["RoadType", "LargeVehicles", "Landmarks", "Weather"]
 SAFE_LAG_SLOTS    = [94, 95, 96, 97, 98]       # 1-day lags (safe from test leakage)
 REGIONAL_LAG_SLOTS = [95, 96, 97]              # regional yesterday-lags
+KNN_K             = 5                          # number of spatial neighbors
 N_SPATIAL_CLUSTERS = 6
 PEAK_MORNING      = (7, 10)                    # inclusive hour range
 PEAK_EVENING      = (17, 20)
@@ -64,6 +65,7 @@ class FeatureEngineer:
         self.global_mean       : float            = 0.0
         # RoadType geohash-level modal imputation (fitted on train, applied to test)
         self.roadtype_lookup   : dict             = {}   # geohash → modal RoadType
+        self.knn_neighbors     : dict             = {}   # geohash → [neighbor_geohash, ...]
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public API
@@ -98,6 +100,9 @@ class FeatureEngineer:
         # Step 4: lag & rolling features (train-only, no leakage issue for train)
         df = self._add_lag_features(df, is_train=True)
         df = self._add_rolling_features(df, is_train=True)
+        df = self._fit_knn_spatial_lags(df)
+        df = self._add_today_lags(df, df)
+        df = self._add_diurnal_rolling_features(df, df)
 
         # Step 5: OOF target encoding  (must come AFTER sort, BEFORE return)
         self.global_mean = float(df[self.target_col].mean())
@@ -146,6 +151,9 @@ class FeatureEngineer:
         # For lag/rolling on test: concatenate train tail with test, compute, then slice
         df = self._add_lag_features(df, is_train=False, train_df=train_df)
         df = self._add_rolling_features(df, is_train=False, train_df=train_df)
+        df = self._apply_knn_spatial_lags(df, train_df=train_df)
+        df = self._add_today_lags(df, ref_df=train_df)
+        df = self._add_diurnal_rolling_features(df, ref_df=train_df)
 
         # Apply (global) target encoding using fitted means
         df = self._apply_target_encode(df)
@@ -238,6 +246,107 @@ class FeatureEngineer:
             (df["latitude"]  - df["spatial_cluster"].map(lambda c: cluster_lats[c])) ** 2 +
             (df["longitude"] - df["spatial_cluster"].map(lambda c: cluster_lons[c])) ** 2
         ).astype(np.float32)
+        return df
+
+    # ── KNN spatial lags ─────────────────────────────────────────────────────
+
+    def _fit_knn_spatial_lags(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        For each unique geohash, finds the KNN_K nearest geohashes by Euclidean distance
+        and pre-computes their yesterday demand (lag 96) averages and stds.
+        Stores the neighbor lookup for later use on test.
+        """
+        target = self.target_col
+        if target not in df.columns:
+            return df
+
+        logger.info(f"Building KNN spatial lag features (k={KNN_K})")
+
+        # Build geohash → (lat, lon) mapping from unique pairs
+        gh_coords = (
+            df.groupby("geohash", observed=True)[["latitude", "longitude"]]
+            .mean()
+        )
+        geohashes = gh_coords.index.tolist()
+        coords    = gh_coords.values  # (N, 2)
+
+        # For each geohash, find k nearest by Euclidean distance
+        from sklearn.neighbors import BallTree
+        import numpy as np
+        ball = BallTree(np.deg2rad(coords), metric="haversine")
+        dists, idxs = ball.query(np.deg2rad(coords), k=KNN_K + 1)  # +1 includes self
+
+        self.knn_neighbors = {}
+        for i, gh in enumerate(geohashes):
+            # Skip index 0 (self), take next KNN_K
+            neighbor_ghs = [geohashes[j] for j in idxs[i, 1:]]
+            self.knn_neighbors[gh] = neighbor_ghs
+
+        # Compute knn-based yesterday lags
+        df = self._compute_knn_features(df, df)
+        return df
+
+    def _apply_knn_spatial_lags(self, df: pd.DataFrame, train_df: pd.DataFrame | None = None) -> pd.DataFrame:
+        """Apply pre-fitted KNN neighbor lookup to test set."""
+        if not self.knn_neighbors:
+            return df
+        ref_df = train_df if train_df is not None else df
+        df = self._compute_knn_features(df, ref_df)
+        return df
+
+    def _compute_knn_features(self, df: pd.DataFrame, ref_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        For each row in df, look up each of its KNN_K neighbor geohashes in ref_df
+        at lag 96 (yesterday, same slot) and compute mean and std of their demand.
+        Vectorized: pre-builds a ((day, slot) x n_geohashes) pivot, then does fast array lookups.
+        """
+        target   = self.target_col
+        fill_val = self.global_mean
+
+        if target not in ref_df.columns:
+            df["knn_lag96_mean"] = fill_val
+            df["knn_lag96_std"]  = 0.0
+            return df
+
+        # Build pivot: (day, time_slot) -> geohash -> demand
+        ref_slice = ref_df[["day", "time_slot", "geohash", target]].copy()
+        pivot = ref_slice.pivot_table(
+            index=["day", "time_slot"], columns="geohash", values=target, aggfunc="mean"
+        )
+
+        geohash_to_col = {gh: i for i, gh in enumerate(pivot.columns)}
+        pivot_arr = pivot.values  # shape: (n_rows, n_geohashes)
+        idx_to_row = {idx: i for i, idx in enumerate(pivot.index)}
+
+        knn_means = np.full(len(df), fill_val, dtype=np.float32)
+        knn_stds  = np.zeros(len(df), dtype=np.float32)
+
+        # Vectorize per unique geohash
+        for gh, neighbors in self.knn_neighbors.items():
+            mask = (df["geohash"] == gh).values
+            if not mask.any():
+                continue
+            neighbor_cols = [geohash_to_col[n] for n in neighbors if n in geohash_to_col]
+            if not neighbor_cols:
+                continue
+
+            rows_in_df = np.where(mask)[0]
+            days       = df["day"].iloc[rows_in_df].values
+            slots      = df["time_slot"].iloc[rows_in_df].values
+
+            for r_idx, d, s in zip(rows_in_df, days, slots):
+                # Lookup day - 1 (yesterday) at the same slot
+                pivot_row = idx_to_row.get((int(d) - 1, int(s)))
+                if pivot_row is None:
+                    continue
+                vals = pivot_arr[pivot_row, neighbor_cols]
+                vals = vals[~np.isnan(vals)]
+                if len(vals) > 0:
+                    knn_means[r_idx] = float(np.mean(vals))
+                    knn_stds[r_idx]  = float(np.std(vals))
+
+        df["knn_lag96_mean"] = knn_means
+        df["knn_lag96_std"]  = knn_stds
         return df
 
     # ── Label encoding ────────────────────────────────────────────────────────
@@ -440,6 +549,120 @@ class FeatureEngineer:
                 df[out_col] = (
                     df[col].astype(str).map(means_dict).fillna(self.global_mean).astype(np.float32)
                 )
+        return df
+
+    def _add_today_lags(self, df: pd.DataFrame, ref_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Adds demand_today_lag_k for k in 0..8.
+        Uses actual demand from the same day at slot k, if time_slot > k.
+        """
+        target = self.target_col
+        # Build pivot of actual demands on ref_df at slots 0..8
+        ref_slice = ref_df[ref_df["time_slot"] <= 8][["day", "geohash", "time_slot", target]].copy()
+        if ref_slice.empty:
+            for k in range(9):
+                df[f"demand_today_lag_{k}"] = np.nan
+            return df
+            
+        pivot = ref_slice.pivot_table(
+            index=["day", "geohash"], columns="time_slot", values=target, aggfunc="mean"
+        )
+        # Re-index pivot columns to ensure 0..8 all exist
+        for k in range(9):
+            if k not in pivot.columns:
+                pivot[k] = np.nan
+        
+        pivot_dict = pivot.to_dict(orient="index") # (day, geohash) -> {0: val, 1: val, ...}
+        
+        # Build features
+        lag_data = {k: np.full(len(df), np.nan, dtype=np.float32) for k in range(9)}
+        
+        # Group df by (day, geohash) to make dictionary lookups fast
+        for (d, gh), group_idx in df.groupby(["day", "geohash"], observed=True).groups.items():
+            slots_map = pivot_dict.get((d, gh))
+            if slots_map is None:
+                continue
+            
+            group_slots = df["time_slot"].iloc[group_idx].values
+            for k in range(9):
+                val = slots_map.get(k)
+                if pd.isna(val):
+                    continue
+                # only apply if time_slot > k
+                mask = group_slots > k
+                if mask.any():
+                    lag_data[k][group_idx[mask]] = val
+                    
+        for k in range(9):
+            df[f"demand_today_lag_{k}"] = lag_data[k]
+            
+        return df
+
+    def _add_diurnal_rolling_features(self, df: pd.DataFrame, ref_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Adds demand_yesterday_rolling_mean_9 and demand_yesterday_rolling_std_9:
+        For each row, looks at yesterday's (day - 1) demand in [time_slot - 4, time_slot + 4] (inclusive).
+        Also adds yesterday_peak_morning_mean (slots 28-40, i.e. hours 7-10)
+        and yesterday_peak_evening_mean (slots 68-80, i.e. hours 17-20).
+        """
+        target = self.target_col
+        fill_val = self.global_mean
+        
+        # Build pivot on ref_df: (day, geohash) -> time_slot -> demand
+        ref_slice = ref_df[["day", "geohash", "time_slot", target]].copy()
+        if ref_slice.empty:
+            df["demand_yesterday_rolling_mean_9"] = fill_val
+            df["demand_yesterday_rolling_std_9"]  = 0.0
+            df["yesterday_peak_morning_mean"]     = fill_val
+            df["yesterday_peak_evening_mean"]     = fill_val
+            return df
+            
+        pivot = ref_slice.pivot_table(
+            index=["day", "geohash"], columns="time_slot", values=target, aggfunc="mean"
+        )
+        for s in range(96):
+            if s not in pivot.columns:
+                pivot[s] = np.nan
+                
+        pivot_dict = pivot.to_dict(orient="index") # (day, geohash) -> {slot: val}
+        
+        rolling_means = np.full(len(df), fill_val, dtype=np.float32)
+        rolling_stds  = np.zeros(len(df), dtype=np.float32)
+        peak_morns    = np.full(len(df), fill_val, dtype=np.float32)
+        peak_eves     = np.full(len(df), fill_val, dtype=np.float32)
+        
+        # Group df by (day, geohash) for fast lookups
+        for (d, gh), group_idx in df.groupby(["day", "geohash"], observed=True).groups.items():
+            # Look up day - 1
+            slots_map = pivot_dict.get((d - 1, gh))
+            if slots_map is None:
+                continue
+                
+            # Compute peak slot averages on yesterday
+            # morning peak: slots 28 to 40 inclusive (hours 7 to 10)
+            morn_vals = [slots_map.get(s) for s in range(28, 41) if not pd.isna(slots_map.get(s))]
+            if morn_vals:
+                peak_morns[group_idx] = float(np.mean(morn_vals))
+                
+            # evening peak: slots 68 to 80 inclusive (hours 17 to 20)
+            eve_vals = [slots_map.get(s) for s in range(68, 81) if not pd.isna(slots_map.get(s))]
+            if eve_vals:
+                peak_eves[group_idx] = float(np.mean(eve_vals))
+                
+            # Compute rolling features per row in this group
+            group_slots = df["time_slot"].iloc[group_idx].values
+            for r_idx, slot in zip(group_idx, group_slots):
+                start_s = max(0, slot - 4)
+                end_s   = min(95, slot + 4)
+                window_vals = [slots_map.get(s) for s in range(start_s, end_s + 1) if not pd.isna(slots_map.get(s))]
+                if window_vals:
+                    rolling_means[r_idx] = float(np.mean(window_vals))
+                    rolling_stds[r_idx]  = float(np.std(window_vals))
+                    
+        df["demand_yesterday_rolling_mean_9"] = rolling_means
+        df["demand_yesterday_rolling_std_9"]  = rolling_stds
+        df["yesterday_peak_morning_mean"]     = peak_morns
+        df["yesterday_peak_evening_mean"]     = peak_eves
         return df
 
     # ── Interaction features ─────────────────────────────────────────────────

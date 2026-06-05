@@ -44,6 +44,7 @@ def run_cv(
     X_test: pd.DataFrame,
     groups: pd.Series | None = None,
     n_folds: int = 2,
+    sample_weight: pd.Series | None = None,
     seed: int = 42,
 ) -> tuple[np.ndarray, np.ndarray, float, int]:
     """
@@ -69,9 +70,13 @@ def run_cv(
     X_trn, y_trn = X_train.iloc[trn_idx], y_train.iloc[trn_idx]
     X_val, y_val = X_train.iloc[val_idx], y_train.iloc[val_idx]
 
+    sample_weight_trn = None
+    if sample_weight is not None:
+        sample_weight_trn = sample_weight.iloc[trn_idx]
+
     # Build and fit model
     model = _build_model(model_name, params, seed=seed)
-    model = _fit_model(model, model_name, X_trn, y_trn, X_val, y_val)
+    model = _fit_model(model, model_name, X_trn, y_trn, X_val, y_val, sample_weight_trn=sample_weight_trn)
 
     # Get best iteration/n_estimators
     best_iter = 1000  # fallback
@@ -103,6 +108,7 @@ def train_on_full_data(
     y_train: pd.Series,
     X_test: pd.DataFrame,
     best_iter: int,
+    sample_weight: pd.Series | None = None,
     seed: int = 42,
 ) -> np.ndarray:
     """
@@ -118,19 +124,19 @@ def train_on_full_data(
         # Disable early stopping/callbacks
         from lightgbm import LGBMRegressor
         model = LGBMRegressor(**p, random_state=seed)
-        model.fit(X_train, y_train)
+        model.fit(X_train, y_train, sample_weight=sample_weight)
         
     elif model_name == "xgb":
         p["n_estimators"] = max(10, best_iter)
         from xgboost import XGBRegressor
         model = XGBRegressor(**p, random_state=seed, eval_metric="rmse")
-        model.fit(X_train, y_train)
+        model.fit(X_train, y_train, sample_weight=sample_weight)
         
     elif model_name == "catboost":
         p["iterations"] = max(10, best_iter)
         from catboost import CatBoostRegressor
         model = CatBoostRegressor(**p, random_seed=seed)
-        model.fit(X_train, y_train, verbose=200)
+        model.fit(X_train, y_train, sample_weight=sample_weight, verbose=200)
         
     else:
         raise ValueError(f"Unknown model name: '{model_name}'")
@@ -159,12 +165,13 @@ def _build_model(name: str, params: dict, seed: int = 42):
         raise ValueError(f"Unknown model name: '{name}'. Choose from: lgbm, xgb, catboost")
 
 
-def _fit_model(model, name: str, X_trn, y_trn, X_val, y_val):
+def _fit_model(model, name: str, X_trn, y_trn, X_val, y_val, sample_weight_trn=None):
     """Fits model with early stopping when supported."""
     if name == "lgbm":
         from lightgbm import early_stopping, log_evaluation
         model.fit(
             X_trn, y_trn,
+            sample_weight=sample_weight_trn,
             eval_set=[(X_val, y_val)],
             callbacks=[early_stopping(100, verbose=False), log_evaluation(200)]
         )
@@ -174,6 +181,7 @@ def _fit_model(model, name: str, X_trn, y_trn, X_val, y_val):
         model.set_params(early_stopping_rounds=100)
         model.fit(
             X_trn, y_trn,
+            sample_weight=sample_weight_trn,
             eval_set=[(X_val, y_val)],
             verbose=200
         )
@@ -181,6 +189,7 @@ def _fit_model(model, name: str, X_trn, y_trn, X_val, y_val):
     elif name == "catboost":
         model.fit(
             X_trn, y_trn,
+            sample_weight=sample_weight_trn,
             eval_set=(X_val, y_val),
             early_stopping_rounds=100,
             verbose=200
