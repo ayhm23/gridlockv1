@@ -176,6 +176,9 @@ def main():
     X_test  = test_fe[feature_cols]
     groups  = train_fe["day"] if "day" in train_fe.columns else None
 
+    # Compute sample weights based on yesterday's same-slot demand (lag 96)
+    sample_weight = 1.0 + X_train["demand_lag_96"] ** 2
+
     logger.info(f"X_train: {X_train.shape} | y_train mean: {y_train.mean():.5f}")
 
     # ── 3. Cross-Validation Training & Full Retraining ───────────────────────
@@ -200,6 +203,7 @@ def main():
             X_test=X_test,
             groups=groups,
             n_folds=args.n_folds,
+            sample_weight=sample_weight,
             seed=args.seed,
         )
         oof_results[model_name]  = oof
@@ -215,6 +219,7 @@ def main():
             y_train=y_train,
             X_test=X_test,
             best_iter=best_iter,
+            sample_weight=sample_weight,
             seed=args.seed,
         )
         test_results[model_name] = test_pred_full
@@ -231,10 +236,15 @@ def main():
     val_oof_matrix = oof_matrix[val_idx]
     val_y_true     = y_train.values[val_idx]
 
-    best_weights, best_rmse = _optimize_blend_weights(val_oof_matrix, val_y_true, n_trials=500)
+    best_weights, best_r2 = _optimize_blend_weights(val_oof_matrix, val_y_true, n_trials=100, seed=args.seed)
+    
+    # Calculate RMSE for this best blend
+    blended_val_preds = np.clip(val_oof_matrix @ best_weights, 0.0, 1.0)
+    best_rmse = float(np.sqrt(mean_squared_error(val_y_true, blended_val_preds)))
 
     logger.info(f"Optimal blend weights: {dict(zip(args.models, best_weights.round(4)))}")
-    logger.info(f"Ensemble OOF RMSE:     {best_rmse:.6f}")
+    logger.info(f"Ensemble OOF R2 Score:  {best_r2 * 100:.4f}%")
+    logger.info(f"Ensemble OOF RMSE:      {best_rmse:.6f}")
     logger.info(f"Individual CV RMSEs:   {cv_scores}")
 
     final_test_preds = test_matrix @ best_weights
@@ -432,6 +442,7 @@ def main():
         "cv_scores":      cv_scores,
         "best_iters":     best_iters,
         "blend_weights":  dict(zip(args.models, best_weights.tolist())),
+        "ensemble_r2":    best_r2 * 100,
         "ensemble_rmse":  best_rmse,
     }
     meta_path = submissions_dir / f"cv_meta_{timestamp}.json"
@@ -454,28 +465,47 @@ def main():
 def _optimize_blend_weights(
     oof_matrix: np.ndarray,
     y_true: np.ndarray,
-    n_trials: int = 500,
+    n_trials: int = 100,
     seed: int = 42
 ) -> tuple[np.ndarray, float]:
     """
-    Randomly search for the best convex combination of OOF predictions
-    that minimizes RMSE. Returns (weights, best_rmse).
+    SLSQP optimization of OOF predictions to maximize R2 score.
+    Returns (weights, best_r2).
     """
-    rng         = np.random.default_rng(seed)
-    n_models    = oof_matrix.shape[1]
-    best_rmse   = float("inf")
-    best_weights = np.ones(n_models) / n_models  # equal weights as default
-
+    from scipy.optimize import minimize
+    from sklearn.metrics import r2_score
+    
+    n_models = oof_matrix.shape[1]
+    
+    def objective(w):
+        if np.sum(w) == 0:
+            return 0.0
+        w_norm = w / np.sum(w)
+        preds = np.clip(oof_matrix @ w_norm, 0.0, 1.0)
+        return -r2_score(y_true, preds)
+        
+    best_r2 = -float("inf")
+    best_weights = np.ones(n_models) / n_models
+    
+    rng = np.random.default_rng(seed)
     for _ in range(n_trials):
-        # Sample from Dirichlet distribution → weights sum to 1
-        w     = rng.dirichlet(np.ones(n_models))
-        preds = np.clip(oof_matrix @ w, 0.0, 1.0)
-        rmse  = float(np.sqrt(mean_squared_error(y_true, preds)))
-        if rmse < best_rmse:
-            best_rmse    = rmse
-            best_weights = w
-
-    return best_weights, best_rmse
+        w0 = rng.dirichlet(np.ones(n_models))
+        res = minimize(
+            objective, 
+            w0, 
+            method="SLSQP", 
+            bounds=[(0.0, 1.0)] * n_models,
+            constraints={"type": "eq", "fun": lambda w: np.sum(w) - 1.0}
+        )
+        if res.success:
+            w_opt = res.x / np.sum(res.x)
+            preds = np.clip(oof_matrix @ w_opt, 0.0, 1.0)
+            r2 = float(r2_score(y_true, preds))
+            if r2 > best_r2:
+                best_r2 = r2
+                best_weights = w_opt
+                
+    return best_weights, best_r2
 
 
 if __name__ == "__main__":
