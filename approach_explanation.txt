@@ -1,0 +1,48 @@
+# Gridlock Traffic Demand Prediction - Approach Summary
+
+## Overview
+Our approach uses a weighted ensemble of gradient boosting models (LightGBM, XGBoost, and CatBoost) combined with extensive spatial-temporal feature engineering and a robust post-processing pipeline. The training pipeline utilizes a custom time-series split with full retraining and SLSQP-based ensembling weight optimization to maximize R2 score, while sample weights prioritize periods of high historical demand.
+
+## Feature Engineering
+We extracted 61 robust features designed to capture the complex spatial, temporal, and historical demand patterns:
+
+1.  **Temporal Features**: `hour`, `minute`, `time_slot`, cyclical representations (`sin_time`, `cos_time`), `day_of_week`, weekend indicators, and Boolean flags for morning/evening peak hours.
+2.  **Spatial Features**: K-Means clustering (k=6) applied to latitude/longitude to identify spatial archetypes, alongside distance to the cluster centroid.
+3.  **Categorical Encoding**: Out-of-Fold (OOF) target encoding for categorical variables like `RoadType`, `LargeVehicles`, `Landmarks`, and `Weather`. Missing `RoadType` values were imputed using the mode for the corresponding geohash.
+4.  **Historical Lags & Rolling Stats**:
+    *   **Safe Lags**: Demand lags from the previous day (lags 94 to 98) ensuring no target leakage.
+    *   **Regional Lags**: Spatially aggregated lags (using first 4 and 5 characters of geohash).
+    *   **KNN Spatial Lags**: Lags from the 5 nearest neighboring geohashes.
+    *   **Same-Day Lags**: Lags 0 through 8 from the current day (Day 49 morning).
+    *   **Diurnal Rolling Stats**: Mean and standard deviation over a 9-slot window on the previous day, plus yesterday's morning/evening peak mean demand.
+5.  **Interaction Features**: Cross features between lanes and hour, spatial cluster and day/slot, geohash and slot, and highway status and slot.
+
+## Modeling and Ensembling
+*   **Models**: LightGBM, XGBoost, and CatBoost regressors.
+*   **Training Strategy**: GroupKFold cross-validation (grouped by day) mimicking the time-series nature of the test set, followed by full retraining on all available data up to the optimal early-stopping iteration.
+*   **Sample Weights**: Applied during training using `1.0 + demand_lag_96 ** 2` to penalize errors more heavily during high-demand periods.
+*   **Ensembling**: Used Scipy's SLSQP optimizer on the OOF predictions to find the optimal convex combination of model weights that maximizes the R2 score.
+
+## Post-Processing Pipeline
+Extensive error analysis revealed significant train-to-test distribution shifts, particularly in high-demand highway zones. We implemented a multi-stage post-processing pipeline:
+
+1.  **Highway Calibration**: Systematically scaled highway predictions up, as the model under-predicted high-speed roads.
+2.  **Mid-range Highway Shrink**: Shrunk predictions below 0.5 by 0.95x to counteract over-calibration on mid-demand highways.
+3.  **Lag-96 Blend**: Blended the ensemble prediction (70%) with the exact demand from the same time slot on the previous day (lag-96) (30%).
+4.  **Day 49 Trend Correction**: Scaled predictions based on the early morning demand trend (Day 49 morning vs Day 48 mean) per geohash.
+5.  **Surge Geohash Correction**: Replaced predictions for 6 specific, highly-shifted highway geohashes with ratio-scaled lag-96 values, validated to improve per-geohash RMSE.
+6.  **Global Bias Subtraction**: Subtracted a constant global bias of 0.008 to correct systematic over-prediction across all road types.
+
+## Tools Used
+*   **Language**: Python
+*   **Data Processing**: Pandas, NumPy
+*   **Machine Learning Models**: LightGBM, XGBoost, CatBoost
+*   **Optimization & Metrics**: Scikit-learn, SciPy
+*   **Environment**: Standard Python virtual environment with pip dependencies.
+
+## Source Files Included
+*   `train.py`: Main training, ensembling, and post-processing pipeline script.
+*   `src/config.py`: Configuration and paths.
+*   `src/feature_engineering.py`: All data preprocessing, spatial/temporal feature extraction, and target encoding logic.
+*   `src/cross_validation.py`: Time-series CV, early stopping, and retraining functions.
+*   `approach_explanation.txt`: This document.
