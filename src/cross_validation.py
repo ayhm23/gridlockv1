@@ -43,79 +43,100 @@ def run_cv(
     y_train: pd.Series,
     X_test: pd.DataFrame,
     groups: pd.Series | None = None,
-    n_folds: int = 5,
+    n_folds: int = 2,
     seed: int = 42,
-) -> tuple[np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray, float, int]:
     """
-    Runs k-fold cross-validation for the specified model.
+    Runs custom time-series cross-validation (Train: Day 48, Validate: Day 49).
+    Also returns the optimal iterations (early stopping rounds) found.
 
     Returns
     -------
-    oof_preds  : np.ndarray — OOF predictions on training set (shape: len(X_train),)
-    test_preds : np.ndarray — Averaged test predictions      (shape: len(X_test),)
-    cv_rmse    : float       — Overall CV RMSE across all folds
+    oof_preds  : np.ndarray — OOF predictions on validation set (Day 49), zero elsewhere.
+    test_preds : np.ndarray — Predictions on test set (Day 49 slots 9-55) from the validation model.
+    cv_rmse    : float       — Validation RMSE on Day 49
+    best_iter  : int         — The best iteration/trees number found during validation early stopping
     """
     oof_preds   = np.zeros(len(X_train), dtype=np.float64)
     test_preds  = np.zeros(len(X_test),  dtype=np.float64)
-    fold_scores = []
 
-    # Choose split strategy
-    if groups is not None and groups.nunique() >= n_folds:
-        splitter = GroupKFold(n_splits=n_folds)
-        splits   = list(splitter.split(X_train, y_train, groups=groups))
-    elif groups is not None and groups.nunique() == 2:
-        # Only 2 unique days → manual day-wise splits
-        splits = _two_day_splits(groups)
-        n_folds = len(splits)
-        logger.info(f"Only 2 unique day groups detected — using {n_folds} day-wise splits")
+    # Split: Train on Day 48, Validate on Day 49
+    trn_idx = np.where(X_train["day"] == 48)[0]
+    val_idx = np.where(X_train["day"] == 49)[0]
+
+    logger.info(f"[{model_name.upper()}] Time-series Split: Train rows={len(trn_idx)}, Val rows={len(val_idx)}")
+
+    X_trn, y_trn = X_train.iloc[trn_idx], y_train.iloc[trn_idx]
+    X_val, y_val = X_train.iloc[val_idx], y_train.iloc[val_idx]
+
+    # Build and fit model
+    model = _build_model(model_name, params, seed=seed)
+    model = _fit_model(model, model_name, X_trn, y_trn, X_val, y_val)
+
+    # Get best iteration/n_estimators
+    best_iter = 1000  # fallback
+    if model_name == "lgbm":
+        best_iter = int(model.best_iteration_)
+    elif model_name == "xgb":
+        best_iter = int(model.best_iteration)
+    elif model_name == "catboost":
+        best_iter = int(model.get_best_iteration())
+        
+    logger.info(f"[{model_name.upper()}] Best early-stopping iteration: {best_iter}")
+
+    # Predict
+    val_pred  = _predict(model, model_name, X_val)
+    test_preds = _predict(model, model_name, X_test)
+
+    oof_preds[val_idx] = val_pred
+
+    cv_rmse = float(np.sqrt(mean_squared_error(y_val, val_pred)))
+    logger.info(f"[{model_name.upper()}] Validation RMSE: {cv_rmse:.6f}")
+
+    return oof_preds, test_preds, cv_rmse, best_iter
+
+
+def train_on_full_data(
+    model_name: str,
+    params: dict,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    best_iter: int,
+    seed: int = 42,
+) -> np.ndarray:
+    """
+    Trains the model on the full training set (Day 48 + Day 49 slots 0-8)
+    for a fixed number of iterations (best_iter) and predicts on X_test.
+    """
+    logger.info(f"[{model_name.upper()}] Retraining on full training set (rows={len(X_train)}) for {best_iter} iterations...")
+    
+    # Copy params and update iterations
+    p = {**params}
+    if model_name == "lgbm":
+        p["n_estimators"] = max(10, best_iter)
+        # Disable early stopping/callbacks
+        from lightgbm import LGBMRegressor
+        model = LGBMRegressor(**p, random_state=seed)
+        model.fit(X_train, y_train)
+        
+    elif model_name == "xgb":
+        p["n_estimators"] = max(10, best_iter)
+        from xgboost import XGBRegressor
+        model = XGBRegressor(**p, random_state=seed, eval_metric="rmse")
+        model.fit(X_train, y_train)
+        
+    elif model_name == "catboost":
+        p["iterations"] = max(10, best_iter)
+        from catboost import CatBoostRegressor
+        model = CatBoostRegressor(**p, random_seed=seed)
+        model.fit(X_train, y_train, verbose=200)
+        
     else:
-        splitter = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
-        splits   = list(splitter.split(X_train))
-
-    for fold_idx, (trn_idx, val_idx) in enumerate(splits):
-        logger.info(f"[{model_name.upper()}] Fold {fold_idx + 1}/{n_folds}")
-
-        X_trn, y_trn = X_train.iloc[trn_idx], y_train.iloc[trn_idx]
-        X_val, y_val = X_train.iloc[val_idx], y_train.iloc[val_idx]
-
-        # ── Train model ─────────────────────────────────────────────────────
-        model = _build_model(model_name, params, seed=seed)
-        model = _fit_model(model, model_name, X_trn, y_trn, X_val, y_val)
-
-        # ── Predict ─────────────────────────────────────────────────────────
-        val_pred  = _predict(model, model_name, X_val)
-        test_fold = _predict(model, model_name, X_test)
-
-        oof_preds[val_idx]  = val_pred
-        test_preds         += test_fold / n_folds
-
-        fold_rmse = float(np.sqrt(mean_squared_error(y_val, val_pred)))
-        fold_scores.append(fold_rmse)
-        logger.info(f"[{model_name.upper()}] Fold {fold_idx + 1} RMSE: {fold_rmse:.6f}")
-
-    cv_rmse = float(np.sqrt(mean_squared_error(y_train, oof_preds)))
-    logger.info(
-        f"[{model_name.upper()}] CV Complete — "
-        f"OOF RMSE: {cv_rmse:.6f} | "
-        f"Fold RMSEs: {[f'{s:.4f}' for s in fold_scores]}"
-    )
-    return oof_preds, test_preds, cv_rmse
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Internal helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _two_day_splits(groups: pd.Series) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Creates two folds: each day used once as the validation set."""
-    unique_days = sorted(groups.unique())
-    splits = []
-    for val_day in unique_days:
-        trn_idx = np.where(groups.values != val_day)[0]
-        val_idx = np.where(groups.values == val_day)[0]
-        splits.append((trn_idx, val_idx))
-    return splits
-
+        raise ValueError(f"Unknown model name: '{model_name}'")
+        
+    test_preds = _predict(model, model_name, X_test)
+    return test_preds
 
 def _build_model(name: str, params: dict, seed: int = 42):
     """Instantiates the model object from its name."""

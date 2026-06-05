@@ -30,8 +30,8 @@ logger = logging.getLogger(__name__)
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 CATEGORICAL_COLS  = ["RoadType", "LargeVehicles", "Landmarks", "Weather"]
-LAG_SLOTS         = [1, 2, 4, 8, 96]          # 15-min slots
-ROLLING_WINDOWS   = [3, 6, 12]                 # trailing windows
+SAFE_LAG_SLOTS    = [94, 95, 96, 97, 98]       # 1-day lags (safe from test leakage)
+REGIONAL_LAG_SLOTS = [95, 96, 97]              # regional yesterday-lags
 N_SPATIAL_CLUSTERS = 6
 PEAK_MORNING      = (7, 10)                    # inclusive hour range
 PEAK_EVENING      = (17, 20)
@@ -253,8 +253,8 @@ class FeatureEngineer:
             return df
 
         if is_train:
-            logger.info(f"Creating lag features for train: {LAG_SLOTS}")
-            for lag in LAG_SLOTS:
+            logger.info(f"Creating safe lag features for train: {SAFE_LAG_SLOTS}")
+            for lag in SAFE_LAG_SLOTS:
                 df[f"demand_lag_{lag}"] = (
                     df.groupby("geohash", observed=True)[target]
                     .shift(lag)
@@ -262,28 +262,31 @@ class FeatureEngineer:
                 )
         else:
             if train_df is not None and target in train_df.columns:
-                logger.info("Creating lag features for test using train tail")
-                # Concatenate, compute lags, then extract test rows
+                logger.info("Creating safe lag features for test using train tail")
                 combined = _safe_concat_for_lags(train_df, df)
-                for lag in LAG_SLOTS:
+                for lag in SAFE_LAG_SLOTS:
                     combined[f"demand_lag_{lag}"] = (
                         combined.groupby("geohash", observed=True)[target]
                         .shift(lag)
                         .astype(np.float32)
                     )
-                test_idx = df.index if not df.index.duplicated().any() else range(len(train_df), len(combined))
-                for lag in LAG_SLOTS:
+                for lag in SAFE_LAG_SLOTS:
                     col = f"demand_lag_{lag}"
                     df[col] = combined[col].iloc[len(train_df):].values
             else:
                 logger.warning("No train_df provided — lag features will be NaN for test")
-                for lag in LAG_SLOTS:
+                for lag in SAFE_LAG_SLOTS:
                     df[f"demand_lag_{lag}"] = np.nan
 
-        # Fill NaN lags with global mean (or 0 if no target)
+        # Yesterday trend statistics (mean and std of the 5 lags)
+        lag_cols = [f"demand_lag_{l}" for l in SAFE_LAG_SLOTS]
+        df["demand_yesterday_mean_5"] = df[lag_cols].mean(axis=1).astype(np.float32)
+        df["demand_yesterday_std_5"] = df[lag_cols].std(axis=1).astype(np.float32)
+
+        # Fill NaNs with global mean
         fill_val = self.global_mean if self.global_mean != 0.0 else 0.0
-        for lag in LAG_SLOTS:
-            col = f"demand_lag_{lag}"
+        cols_to_fill = lag_cols + ["demand_yesterday_mean_5", "demand_yesterday_std_5"]
+        for col in cols_to_fill:
             if col in df.columns:
                 df[col] = df[col].fillna(fill_val).astype(np.float32)
         return df
@@ -296,54 +299,61 @@ class FeatureEngineer:
         is_train: bool,
         train_df: pd.DataFrame | None = None
     ) -> pd.DataFrame:
+        """
+        Actually adds regional lags (geohash_5 and geohash_4 shifted by 95, 96, 97)
+        to capture historical spatial context from yesterday.
+        """
         target = self.target_col
         if target not in df.columns and is_train:
             return df
 
-        def _compute_rolling(frame: pd.DataFrame) -> pd.DataFrame:
-            grp = frame.groupby("geohash", observed=True)[target]
-            for w in ROLLING_WINDOWS:
-                frame[f"demand_roll_mean_{w}"] = (
-                    grp.transform(lambda x: x.shift(1).rolling(w, min_periods=1).mean())
-                    .astype(np.float32)
-                )
-            frame["demand_roll_std_6"] = (
-                grp.transform(lambda x: x.shift(1).rolling(6, min_periods=2).std())
-                .astype(np.float32)
-            )
-            frame["demand_roll_max_6"] = (
-                grp.transform(lambda x: x.shift(1).rolling(6, min_periods=1).max())
-                .astype(np.float32)
-            )
+        def _compute_regional(frame: pd.DataFrame) -> pd.DataFrame:
+            frame["geohash_5"] = frame["geohash"].str[:-1]
+            frame["geohash_4"] = frame["geohash"].str[:-2]
+            
+            # Regional means
+            reg5_mean = frame.groupby(["day", "time_slot", "geohash_5"], observed=True)[target].transform("mean")
+            reg4_mean = frame.groupby(["day", "time_slot", "geohash_4"], observed=True)[target].transform("mean")
+            
+            frame["reg5_demand"] = reg5_mean
+            frame["reg4_demand"] = reg4_mean
+            
+            # Shifts
+            for lag in REGIONAL_LAG_SLOTS:
+                frame[f"reg5_demand_lag_{lag}"] = frame.groupby("geohash", observed=True)["reg5_demand"].shift(lag).astype(np.float32)
+                frame[f"reg4_demand_lag_{lag}"] = frame.groupby("geohash", observed=True)["reg4_demand"].shift(lag).astype(np.float32)
+            
+            # Cleanup intermediate columns
+            frame.drop(columns=["geohash_5", "geohash_4", "reg5_demand", "reg4_demand"], inplace=True, errors="ignore")
             return frame
 
         if is_train:
-            logger.info(f"Creating rolling features for train — windows: {ROLLING_WINDOWS}")
-            df = _compute_rolling(df)
+            logger.info("Creating regional lag features for train")
+            df = _compute_regional(df)
         else:
             if train_df is not None and target in train_df.columns:
-                logger.info("Creating rolling features for test using train tail")
+                logger.info("Creating regional lag features for test using train tail")
                 combined = _safe_concat_for_lags(train_df, df)
-                combined = _compute_rolling(combined)
-                roll_cols = (
-                    [f"demand_roll_mean_{w}" for w in ROLLING_WINDOWS]
-                    + ["demand_roll_std_6", "demand_roll_max_6"]
-                )
-                for col in roll_cols:
+                combined = _compute_regional(combined)
+                
+                regional_cols = []
+                for lag in REGIONAL_LAG_SLOTS:
+                    regional_cols.extend([f"reg5_demand_lag_{lag}", f"reg4_demand_lag_{lag}"])
+                    
+                for col in regional_cols:
                     df[col] = combined[col].iloc[len(train_df):].values
             else:
-                for w in ROLLING_WINDOWS:
-                    df[f"demand_roll_mean_{w}"] = np.nan
-                df["demand_roll_std_6"] = np.nan
-                df["demand_roll_max_6"] = np.nan
+                for lag in REGIONAL_LAG_SLOTS:
+                    df[f"reg5_demand_lag_{lag}"] = np.nan
+                    df[f"reg4_demand_lag_{lag}"] = np.nan
 
-        # Fill NaN rolling with global mean
+        # Fill NaNs with global mean
         fill_val = self.global_mean if self.global_mean != 0.0 else 0.0
-        roll_cols = (
-            [f"demand_roll_mean_{w}" for w in ROLLING_WINDOWS]
-            + ["demand_roll_std_6", "demand_roll_max_6"]
-        )
-        for col in roll_cols:
+        regional_cols = []
+        for lag in REGIONAL_LAG_SLOTS:
+            regional_cols.extend([f"reg5_demand_lag_{lag}", f"reg4_demand_lag_{lag}"])
+            
+        for col in regional_cols:
             if col in df.columns:
                 df[col] = df[col].fillna(fill_val).astype(np.float32)
         return df

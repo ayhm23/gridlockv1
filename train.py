@@ -178,18 +178,21 @@ def main():
 
     logger.info(f"X_train: {X_train.shape} | y_train mean: {y_train.mean():.5f}")
 
-    # ── 3. Cross-Validation Training ─────────────────────────────────────────
+    # ── 3. Cross-Validation Training & Full Retraining ───────────────────────
     oof_results  : dict[str, np.ndarray] = {}
     test_results : dict[str, np.ndarray] = {}
     cv_scores    : dict[str, float]       = {}
+    best_iters   : dict[str, int]         = {}
+
+    from src.cross_validation import train_on_full_data
 
     for model_name in args.models:
         logger.info(f"\n{'---' * 14}")
-        logger.info(f"Training: {model_name.upper()}")
+        logger.info(f"Validating: {model_name.upper()}")
         logger.info(f"{'---' * 14}")
         params = MODEL_PARAMS[model_name]
 
-        oof, test_pred, rmse = run_cv(
+        oof, _, rmse, best_iter = run_cv(
             model_name=model_name,
             params=params,
             X_train=X_train,
@@ -200,18 +203,35 @@ def main():
             seed=args.seed,
         )
         oof_results[model_name]  = oof
-        test_results[model_name] = test_pred
         cv_scores[model_name]    = rmse
+        best_iters[model_name]   = best_iter
+
+        # Now, retrain on the FULL train set
+        logger.info(f"\nRetraining {model_name.upper()} on all data...")
+        test_pred_full = train_on_full_data(
+            model_name=model_name,
+            params=params,
+            X_train=X_train,
+            y_train=y_train,
+            X_test=X_test,
+            best_iter=best_iter,
+            seed=args.seed,
+        )
+        test_results[model_name] = test_pred_full
 
     # ── 4. Ensemble / Blend ──────────────────────────────────────────────────
     logger.info("\n" + "=" * 60)
     logger.info("Blending model predictions...")
 
-    # Compute optimal ensemble weights by minimizing OOF RMSE
+    # Compute optimal ensemble weights by minimizing OOF RMSE on validation fold (day 49)
+    val_idx = np.where(train_fe["day"] == 49)[0]
     oof_matrix  = np.column_stack([oof_results[m]  for m in args.models])
     test_matrix = np.column_stack([test_results[m] for m in args.models])
 
-    best_weights, best_rmse = _optimize_blend_weights(oof_matrix, y_train.values, n_trials=500)
+    val_oof_matrix = oof_matrix[val_idx]
+    val_y_true     = y_train.values[val_idx]
+
+    best_weights, best_rmse = _optimize_blend_weights(val_oof_matrix, val_y_true, n_trials=500)
 
     logger.info(f"Optimal blend weights: {dict(zip(args.models, best_weights.round(4)))}")
     logger.info(f"Ensemble OOF RMSE:     {best_rmse:.6f}")
@@ -257,10 +277,10 @@ def main():
     meta = {
         "timestamp":      timestamp,
         "models":         args.models,
-        "n_folds":        args.n_folds,
         "seed":           args.seed,
         "feature_count":  len(feature_cols),
         "cv_scores":      cv_scores,
+        "best_iters":     best_iters,
         "blend_weights":  dict(zip(args.models, best_weights.tolist())),
         "ensemble_rmse":  best_rmse,
     }
