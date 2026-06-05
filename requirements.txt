@@ -8,3 +8,6 @@ matplotlib
 seaborn
 scipy
 folium
+lightgbm
+xgboost
+catboost

@@ -10,7 +10,9 @@ __pycache__/
 
 # Datasets (large files ignored, raw CSVs can be kept or ignored, we will ignore processed data to keep git history lightweight)
 data/processed/
+data/raw/
 dataset/
+submissions/
 
 # Logs
 logs/
