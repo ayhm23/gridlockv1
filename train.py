@@ -280,6 +280,18 @@ def main():
     except Exception as e:
         logger.warning(f"Highway calibration failed (skipping): {e}")
 
+    # ── 4b2. Mid-range Highway Shrink ─────────────────────────────────────────
+    # The uniform highway scalar overcorrects mid-range predictions (true ∈ 0.2–0.4).
+    # Shrinking highway preds below 0.5 by 0.95× reduces this over-prediction.
+    HW_SHRINK = 0.95
+    try:
+        shrink_mask = hw_test_idx & (final_test_preds < 0.5)
+        if shrink_mask.sum() > 0:
+            final_test_preds[shrink_mask] *= HW_SHRINK
+            logger.info(f"  Mid-range highway shrink ({HW_SHRINK}): {shrink_mask.sum()} rows adjusted")
+    except Exception as e:
+        logger.warning(f"Highway shrink failed (skipping): {e}")
+
     # ── 4c. Lag-96 Blend ──────────────────────────────────────────────────────
     # Analysis: blending model predictions 70% + lag_96 30% reduces RMSE by 8.5%.
     # lag_96 = demand at same (geohash, time_slot) on day 48 (train data).
